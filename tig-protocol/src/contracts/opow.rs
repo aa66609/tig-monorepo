@@ -11,6 +11,7 @@ pub(crate) async fn update(cache: &mut AddBlockCache) {
         block_details,
         block_data,
         active_challenges_block_data,
+        active_challenges_prev_block_data,
         active_algorithms_state,
         active_algorithms_details,
         active_algorithms_block_data,
@@ -53,7 +54,7 @@ pub(crate) async fn update(cache: &mut AddBlockCache) {
     }
 
     let mut num_solutions_by_player_by_challenge = HashMap::<String, HashMap<String, u32>>::new();
-    for (settings, num_solutions) in active_solutions.values() {
+    for (settings, num_solutions, _) in active_solutions.iter() {
         *num_solutions_by_player_by_challenge
             .entry(settings.player_id.clone())
             .or_default()
@@ -93,12 +94,13 @@ pub(crate) async fn update(cache: &mut AddBlockCache) {
     }
 
     // update qualifiers
-    let mut solutions_by_challenge = HashMap::<String, Vec<(&BenchmarkSettings, &u32)>>::new();
-    for (settings, num_solutions) in active_solutions.values() {
+    let mut solutions_by_challenge =
+        HashMap::<String, Vec<(&BenchmarkSettings, &u32, &u32)>>::new();
+    for (settings, num_solutions, num_nonces) in active_solutions.iter() {
         solutions_by_challenge
             .entry(settings.challenge_id.clone())
             .or_default()
-            .push((settings, num_solutions));
+            .push((settings, num_solutions, num_nonces));
     }
 
     let max_qualifiers_by_player = active_opow_ids
@@ -118,7 +120,7 @@ pub(crate) async fn update(cache: &mut AddBlockCache) {
         let solutions = solutions_by_challenge.get_mut(challenge_id).unwrap();
         let points = solutions
             .iter()
-            .map(|(settings, _)| settings.difficulty.clone())
+            .map(|(settings, _, _)| settings.difficulty.clone())
             .collect::<Frontier>();
         let mut frontier_indexes = HashMap::<Point, usize>::new();
         for (frontier_index, frontier) in pareto_algorithm(&points, false).into_iter().enumerate() {
@@ -126,60 +128,126 @@ pub(crate) async fn update(cache: &mut AddBlockCache) {
                 frontier_indexes.insert(point, frontier_index);
             }
         }
-        solutions.sort_by(|(a_settings, _), (b_settings, _)| {
-            let a_index = frontier_indexes[&a_settings.difficulty];
-            let b_index = frontier_indexes[&b_settings.difficulty];
-            a_index.cmp(&b_index)
-        });
+        let mut solutions_by_frontier_idx =
+            HashMap::<usize, Vec<(&BenchmarkSettings, &u32, &u32)>>::new();
+        for &x in solutions.iter() {
+            solutions_by_frontier_idx
+                .entry(frontier_indexes[&x.0.difficulty])
+                .or_default()
+                .push(x);
+        }
 
-        let mut max_qualifiers_by_player = max_qualifiers_by_player.clone();
-        let mut curr_frontier_index = 0;
         let challenge_data = active_challenges_block_data.get_mut(challenge_id).unwrap();
-        for (settings, &num_solutions) in solutions.iter() {
-            let BenchmarkSettings {
-                player_id,
-                algorithm_id,
-                challenge_id,
-                difficulty,
-                ..
-            } = settings;
+        let prev_solution_ratio = active_challenges_prev_block_data
+            .get(challenge_id)
+            .map(|x| x.average_solution_ratio)
+            .unwrap_or_default();
+        let min_solution_ratio = prev_solution_ratio * config.opow.min_solution_ratio_factor;
+        let min_num_nonces = config.opow.min_num_nonces;
+        let mut player_algorithm_solutions = HashMap::<String, HashMap<String, u32>>::new();
+        let mut player_solutions = HashMap::<String, u32>::new();
+        let mut player_nonces = HashMap::<String, u32>::new();
 
-            if curr_frontier_index != frontier_indexes[difficulty]
-                && challenge_data.num_qualifiers > config.opow.total_qualifiers_threshold
+        for frontier_idx in 0..solutions_by_frontier_idx.len() {
+            for (settings, &num_solutions, &num_nonces) in
+                solutions_by_frontier_idx[&frontier_idx].iter()
             {
+                let BenchmarkSettings {
+                    player_id,
+                    algorithm_id,
+                    challenge_id,
+                    difficulty,
+                    ..
+                } = settings;
+
+                let difficulty_parameters = &config.challenges.difficulty_parameters[challenge_id];
+                let min_difficulty = difficulty_parameters.min_difficulty();
+                let max_difficulty = difficulty_parameters.max_difficulty();
+                if (0..difficulty.len())
+                    .into_iter()
+                    .any(|i| difficulty[i] < min_difficulty[i] || difficulty[i] > max_difficulty[i])
+                {
+                    continue;
+                }
+                *player_algorithm_solutions
+                    .entry(player_id.clone())
+                    .or_default()
+                    .entry(algorithm_id.clone())
+                    .or_default() += num_solutions;
+                *player_solutions.entry(player_id.clone()).or_default() += num_solutions;
+                *player_nonces.entry(player_id.clone()).or_default() += num_nonces;
+
+                challenge_data
+                    .qualifier_difficulties
+                    .insert(difficulty.clone());
+            }
+
+            // check if we have enough qualifiers
+            let player_solution_ratio: HashMap<String, f64> = player_solutions
+                .keys()
+                .map(|player_id| {
+                    (
+                        player_id.clone(),
+                        player_solutions[player_id] as f64 / player_nonces[player_id] as f64,
+                    )
+                })
+                .collect();
+            let player_qualifiers: HashMap<String, u32> = player_solution_ratio
+                .keys()
+                .map(|player_id| {
+                    (
+                        player_id.clone(),
+                        if player_nonces[player_id] >= min_num_nonces
+                            && player_solution_ratio[player_id] >= min_solution_ratio
+                        {
+                            max_qualifiers_by_player[player_id].min(player_solutions[player_id])
+                        } else {
+                            0
+                        },
+                    )
+                })
+                .collect();
+
+            let num_qualifiers = player_qualifiers.values().sum::<u32>();
+            if num_qualifiers >= config.opow.total_qualifiers_threshold
+                || frontier_idx == solutions_by_frontier_idx.len() - 1
+            {
+                let mut sum_weighted_solution_ratio = 0.0;
+                for player_id in player_qualifiers.keys() {
+                    let opow_data = active_opow_block_data.get_mut(player_id).unwrap();
+                    opow_data
+                        .num_qualifiers_by_challenge
+                        .insert(challenge_id.clone(), player_qualifiers[player_id]);
+                    opow_data
+                        .solution_ratio_by_challenge
+                        .insert(challenge_id.clone(), player_solution_ratio[player_id]);
+
+                    sum_weighted_solution_ratio +=
+                        player_solution_ratio[player_id] * player_qualifiers[player_id] as f64;
+
+                    if player_qualifiers[player_id] > 0 {
+                        for algorithm_id in player_algorithm_solutions[player_id].keys() {
+                            let algorithm_data =
+                                active_algorithms_block_data.get_mut(algorithm_id).unwrap();
+
+                            algorithm_data.num_qualifiers_by_player.insert(
+                                player_id.clone(),
+                                (player_qualifiers[player_id] as f64
+                                    * player_algorithm_solutions[player_id][algorithm_id] as f64
+                                    / player_solutions[player_id] as f64)
+                                    .ceil() as u32,
+                            );
+                        }
+                    }
+                }
+                challenge_data.num_qualifiers = num_qualifiers;
+                challenge_data.average_solution_ratio = if num_qualifiers == 0 {
+                    0.0
+                } else {
+                    sum_weighted_solution_ratio / num_qualifiers as f64
+                };
                 break;
             }
-            let difficulty_parameters = &config.challenges.difficulty_parameters[challenge_id];
-            let min_difficulty = difficulty_parameters.min_difficulty();
-            let max_difficulty = difficulty_parameters.max_difficulty();
-            if (0..difficulty.len())
-                .into_iter()
-                .any(|i| difficulty[i] < min_difficulty[i] || difficulty[i] > max_difficulty[i])
-            {
-                continue;
-            }
-            curr_frontier_index = frontier_indexes[difficulty];
-            let player_data = active_opow_block_data.get_mut(player_id).unwrap();
-            let algorithm_data = active_algorithms_block_data.get_mut(algorithm_id).unwrap();
-
-            let max_qualifiers = max_qualifiers_by_player.get(player_id).unwrap().clone();
-            let num_qualifiers = num_solutions.min(max_qualifiers);
-            max_qualifiers_by_player.insert(player_id.clone(), max_qualifiers - num_qualifiers);
-
-            if num_qualifiers > 0 {
-                *player_data
-                    .num_qualifiers_by_challenge
-                    .entry(challenge_id.clone())
-                    .or_default() += num_qualifiers;
-                *algorithm_data
-                    .num_qualifiers_by_player
-                    .entry(player_id.clone())
-                    .or_default() += num_qualifiers;
-                challenge_data.num_qualifiers += num_qualifiers;
-            }
-            challenge_data
-                .qualifier_difficulties
-                .insert(difficulty.clone());
         }
     }
 
@@ -246,18 +314,6 @@ pub(crate) async fn update(cache: &mut AddBlockCache) {
         return;
     }
 
-    let num_qualifiers_by_challenge: HashMap<String, u32> = active_challenge_ids
-        .iter()
-        .map(|challenge_id| {
-            (
-                challenge_id.clone(),
-                active_challenges_block_data[challenge_id]
-                    .num_qualifiers
-                    .clone(),
-            )
-        })
-        .collect();
-
     for player_id in active_opow_ids.iter() {
         let opow_data = active_opow_block_data.get_mut(player_id).unwrap();
         opow_data.self_deposit = self_deposit[player_id].clone();
@@ -303,45 +359,52 @@ pub(crate) async fn update(cache: &mut AddBlockCache) {
     for player_id in active_opow_ids.iter() {
         let opow_data = active_opow_block_data.get_mut(player_id).unwrap();
 
-        let mut percent_qualifiers = Vec::<PreciseNumber>::new();
+        let mut challenge_factors = Vec::<PreciseNumber>::new();
         for challenge_id in active_challenge_ids.iter() {
-            let num_qualifiers = num_qualifiers_by_challenge[challenge_id];
-            let num_qualifiers_by_player = *opow_data
-                .num_qualifiers_by_challenge
-                .get(challenge_id)
-                .unwrap_or(&0);
-
-            percent_qualifiers.push(if num_qualifiers_by_player == 0 {
-                PreciseNumber::from(0)
+            let challenge_data = active_challenges_block_data.get(challenge_id).unwrap();
+            challenge_factors.push(if challenge_data.num_qualifiers == 0 {
+                zero.clone()
             } else {
-                PreciseNumber::from(num_qualifiers_by_player) / PreciseNumber::from(num_qualifiers)
+                let fraction_qualifiers = PreciseNumber::from(
+                    *opow_data
+                        .num_qualifiers_by_challenge
+                        .get(challenge_id)
+                        .unwrap_or(&0),
+                ) / PreciseNumber::from(challenge_data.num_qualifiers);
+                let reliability = *opow_data
+                    .solution_ratio_by_challenge
+                    .get(challenge_id)
+                    .unwrap_or(&0.0)
+                    / challenge_data.average_solution_ratio;
+                fraction_qualifiers
+                    * PreciseNumber::from_f64(reliability.min(config.opow.max_reliability))
             });
         }
 
-        let mut percent_deposit = if total_deposit == zero {
+        let mut deposit_factor = if total_deposit == zero {
             zero.clone()
         } else {
             opow_data.delegated_weighted_deposit / total_deposit
         };
-        let mean_percent_qualifiers = percent_qualifiers.arithmetic_mean();
+        let mean_challenge_factor = challenge_factors.arithmetic_mean();
         let max_deposit_to_qualifier_ratio =
             PreciseNumber::from_f64(config.opow.max_deposit_to_qualifier_ratio);
-        if mean_percent_qualifiers == zero {
-            percent_deposit = zero.clone();
-        } else if percent_deposit / mean_percent_qualifiers > max_deposit_to_qualifier_ratio {
-            percent_deposit = mean_percent_qualifiers * max_deposit_to_qualifier_ratio;
+        if mean_challenge_factor == zero {
+            deposit_factor = zero.clone();
+        } else if deposit_factor / mean_challenge_factor > max_deposit_to_qualifier_ratio {
+            deposit_factor = mean_challenge_factor * max_deposit_to_qualifier_ratio;
         }
 
-        let sum_percent_qualifiers: PreciseNumber = percent_qualifiers.iter().cloned().sum();
-        let weighted_mean = (sum_percent_qualifiers
-            + percent_deposit * PreciseNumber::from_f64(config.opow.deposit_multiplier))
+        let sum_challenge_factors: PreciseNumber = challenge_factors.iter().cloned().sum();
+        let weighted_mean = (sum_challenge_factors
+            + deposit_factor * PreciseNumber::from_f64(config.opow.deposit_multiplier))
             / PreciseNumber::from_f64(
                 active_challenge_ids.len() as f64 + config.opow.deposit_multiplier,
             );
-        let mut qualifiers_and_deposit = percent_qualifiers;
-        qualifiers_and_deposit.push(percent_deposit);
-        let mean = qualifiers_and_deposit.arithmetic_mean();
-        let variance = qualifiers_and_deposit.variance();
+        let mut all_factors = challenge_factors;
+        all_factors.push(deposit_factor);
+        let mean = all_factors.arithmetic_mean();
+        let variance = all_factors.variance();
         let cv_sqr = if mean == zero {
             zero.clone()
         } else {
